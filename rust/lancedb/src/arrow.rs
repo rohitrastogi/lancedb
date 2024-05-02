@@ -127,6 +127,7 @@ impl<T: arrow_array::RecordBatchReader + Send + 'static> IntoArrow for T {
 pub struct PolarsDataFrameRecordBatchReader {
     chunks: std::vec::IntoIter<ArrowChunk>,
     arrow_schema: Arc<arrow_schema::Schema>,
+    polars_arrow_fields: Vec<polars_arrow::datatypes::Field>,
 }
 
 #[cfg(feature = "polars")]
@@ -135,15 +136,30 @@ impl PolarsDataFrameRecordBatchReader {
     /// If the input dataframe does not have aligned chunks, this function undergoes
     /// the costly operation of reallocating each series as a single contigous chunk.
     pub fn new(mut df: DataFrame) -> Result<Self> {
+        let mut polars_arrow_fields = Vec::with_capacity(df.schema().len());
+        let arrow_rs_fields: Result<Vec<arrow_schema::Field>> = df
+            .schema()
+            .into_iter()
+            .map(|(name, df_dtype)| {
+                let polars_arrow_dtype = df_dtype.to_arrow(false);
+                let polars_arrow_field =
+                    polars_arrow::datatypes::Field::new(name, polars_arrow_dtype, true);
+                polars_arrow_fields.push(polars_arrow_field.clone());
+                polars_arrow_convertors::convert_polars_arrow_field_to_arrow_rs_field(
+                    polars_arrow_field,
+                )
+            })
+            .collect();
+
         df.align_chunks();
-        let arrow_schema =
-            polars_arrow_convertors::convert_polars_df_schema_to_arrow_rb_schema(df.schema())?;
+
         Ok(Self {
             chunks: df
                 .iter_chunks(polars_arrow_convertors::POLARS_ARROW_FLAVOR)
                 .collect::<Vec<ArrowChunk>>()
                 .into_iter(),
-            arrow_schema,
+            arrow_schema: Arc::new(arrow_schema::Schema::new(arrow_rs_fields?)),
+            polars_arrow_fields,
         })
     }
 }
@@ -154,19 +170,25 @@ impl Iterator for PolarsDataFrameRecordBatchReader {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.chunks.next().map(|chunk| {
-            let columns: std::result::Result<Vec<arrow_array::ArrayRef>, arrow_schema::ArrowError> =
-                chunk
-                    .into_arrays()
-                    .into_iter()
-                    .zip(self.arrow_schema.fields.iter())
-                    .map(|(polars_array, arrow_field)| {
-                        polars_arrow_convertors::convert_polars_arrow_array_to_arrow_rs_array(
-                            polars_array,
-                            arrow_field.data_type().clone(),
-                        )
-                    })
-                    .collect();
-            arrow_array::RecordBatch::try_new(self.arrow_schema.clone(), columns?)
+            let struct_dtype =
+                polars::datatypes::ArrowDataType::Struct(self.polars_arrow_fields.clone());
+            // should never panic if dataframe exists
+            let struct_array =
+                polars_arrow::array::StructArray::new(struct_dtype, chunk.into_arrays(), None);
+            let arrow_rs_struct_array =
+                polars_arrow_convertors::convert_polars_arrow_array_to_arrow_rs_array(
+                    Box::new(struct_array),
+                    arrow_schema::DataType::Struct(self.arrow_schema.fields.clone()),
+                )?;
+            arrow_array::RecordBatch::try_new(
+                self.arrow_schema.clone(),
+                arrow_rs_struct_array
+                    .as_any()
+                    .downcast_ref::<arrow_array::StructArray>()
+                    .unwrap()
+                    .columns()
+                    .to_vec(),
+            )
         })
     }
 }
@@ -194,7 +216,7 @@ impl IntoPolars for SendableRecordBatchStream {
         let mut acc_df: DataFrame = DataFrame::from(&polars_schema);
         while let Some(record_batch) = self.next().await {
             let new_df = polars_arrow_convertors::convert_arrow_rb_to_polars_df(
-                &record_batch?,
+                record_batch?,
                 &polars_schema,
             )?;
             acc_df = acc_df.vstack(&new_df)?;

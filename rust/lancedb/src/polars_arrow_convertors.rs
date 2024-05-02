@@ -23,22 +23,6 @@ use std::{mem, sync::Arc};
 pub const POLARS_ARROW_FLAVOR: bool = false;
 const IS_ARRAY_NULLABLE: bool = true;
 
-/// Converts a Polars DataFrame schema to an Arrow RecordBatch schema.
-pub fn convert_polars_df_schema_to_arrow_rb_schema(
-    polars_df_schema: polars::prelude::Schema,
-) -> Result<Arc<arrow_schema::Schema>> {
-    let arrow_fields: Result<Vec<arrow_schema::Field>> = polars_df_schema
-        .into_iter()
-        .map(|(name, df_dtype)| {
-            let polars_arrow_dtype = df_dtype.to_arrow(POLARS_ARROW_FLAVOR);
-            let polars_field =
-                polars_arrow::datatypes::Field::new(name, polars_arrow_dtype, IS_ARRAY_NULLABLE);
-            convert_polars_arrow_field_to_arrow_rs_field(polars_field)
-        })
-        .collect();
-    Ok(Arc::new(arrow_schema::Schema::new(arrow_fields?)))
-}
-
 /// Converts an Arrow RecordBatch schema to a Polars DataFrame schema.
 pub fn convert_arrow_rb_schema_to_polars_df_schema(
     arrow_schema: &arrow_schema::Schema,
@@ -59,23 +43,36 @@ pub fn convert_arrow_rb_schema_to_polars_df_schema(
 
 /// Converts an Arrow RecordBatch to a Polars DataFrame, using a provided Polars DataFrame schema.
 pub fn convert_arrow_rb_to_polars_df(
-    arrow_rb: &arrow::record_batch::RecordBatch,
+    arrow_rb: arrow::record_batch::RecordBatch,
     polars_schema: &polars::prelude::Schema,
 ) -> Result<DataFrame> {
-    let mut columns: Vec<Series> = Vec::with_capacity(arrow_rb.num_columns());
-
-    for (i, column) in arrow_rb.columns().iter().enumerate() {
-        let polars_df_dtype = polars_schema.try_get_at_index(i)?.1;
-        let polars_arrow_dtype = polars_df_dtype.to_arrow(POLARS_ARROW_FLAVOR);
-        let polars_array =
-            convert_arrow_rs_array_to_polars_arrow_array(column, polars_arrow_dtype)?;
-        columns.push(Series::from_arrow(
-            polars_schema.try_get_at_index(i)?.0,
-            polars_array,
-        )?);
-    }
-
-    Ok(DataFrame::from_iter(columns))
+    let arrow_struct_array = arrow_array::array::StructArray::from(arrow_rb);
+    let polars_arrow_fields: Vec<polars_arrow::datatypes::Field> = polars_schema
+        .iter()
+        .map(|(name, polars_df_dtype)| {
+            let polars_arrow_dtype = polars_df_dtype.to_arrow(POLARS_ARROW_FLAVOR);
+            polars_arrow::datatypes::Field::new(name.clone(), polars_arrow_dtype, IS_ARRAY_NULLABLE)
+        })
+        .collect();
+    let polars_arrow_struct_array_dtype =
+        polars_arrow::datatypes::ArrowDataType::Struct(polars_arrow_fields);
+    let polars_arrow_struct_array = convert_arrow_rs_array_to_polars_arrow_array(
+        Arc::new(arrow_struct_array),
+        polars_arrow_struct_array_dtype,
+    )?;
+    let polars_struct_array = polars_arrow_struct_array
+        .as_any()
+        .downcast_ref::<polars_arrow::array::StructArray>()
+        .unwrap();
+    Ok(DataFrame::from_iter(
+        polars_struct_array
+            .values()
+            .iter()
+            .zip(polars_schema.iter_names())
+            .map(|(column, name)| {
+                Series::from_arrow(name, polars_arrow::array::clone(column.as_ref())).unwrap()
+            }),
+    ))
 }
 
 /// Converts a polars-arrow Arrow array to an arrow-rs Arrow array.
@@ -91,8 +88,8 @@ pub fn convert_polars_arrow_array_to_arrow_rs_array(
 }
 
 /// Converts an arrow-rs Arrow array to a polars-arrow Arrow array.
-fn convert_arrow_rs_array_to_polars_arrow_array(
-    arrow_rs_array: &Arc<dyn arrow_array::Array>,
+pub fn convert_arrow_rs_array_to_polars_arrow_array(
+    arrow_rs_array: Arc<dyn arrow_array::Array>,
     polars_arrow_dtype: polars::datatypes::ArrowDataType,
 ) -> Result<Box<dyn polars_arrow::array::Array>> {
     let arrow_c_array = arrow::ffi::FFI_ArrowArray::new(&arrow_rs_array.to_data());
@@ -100,7 +97,7 @@ fn convert_arrow_rs_array_to_polars_arrow_array(
     Ok(unsafe { polars_arrow::ffi::import_array_from_c(polars_c_array, polars_arrow_dtype) }?)
 }
 
-fn convert_polars_arrow_field_to_arrow_rs_field(
+pub fn convert_polars_arrow_field_to_arrow_rs_field(
     polars_arrow_field: polars_arrow::datatypes::Field,
 ) -> Result<arrow_schema::Field> {
     let polars_c_schema = polars_arrow::ffi::export_field_to_c(&polars_arrow_field);
@@ -113,7 +110,7 @@ fn convert_polars_arrow_field_to_arrow_rs_field(
     ))
 }
 
-fn convert_arrow_rs_field_to_polars_arrow_field(
+pub fn convert_arrow_rs_field_to_polars_arrow_field(
     arrow_rs_field: &arrow_schema::Field,
 ) -> Result<polars_arrow::datatypes::Field> {
     let arrow_rs_dtype = arrow_rs_field.data_type();
